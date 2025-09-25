@@ -5,6 +5,7 @@ const nfa_builder = @import("nfa_builder.zig");
 const matcher = @import("matcher.zig");
 const streaming = @import("streaming.zig");
 const jit = @import("jit.zig");
+const build_options = @import("build_options");
 
 pub const RegexError = error{
     InvalidPattern,
@@ -18,7 +19,7 @@ pub const RegexError = error{
 pub const Match = struct {
     start: usize,
     end: usize,
-    groups: ?[]?Match = null,
+    groups: ?[]?Match = if (build_options.capture_groups) null else null,
 
     pub fn slice(self: Match, input: []const u8) []const u8 {
         return input[self.start..self.end];
@@ -60,7 +61,8 @@ pub const Regex = struct {
 
         // Optionally compile to JIT if enabled
         var jit_program: ?jit.Program = null;
-        if (false) { // JIT disabled for now (basic implementation)
+        const jit_enabled = build_options.jit_enabled;
+        if (jit_enabled) { // JIT enabled
             var jit_compiler = jit.JITCompiler.init(allocator);
             defer jit_compiler.deinit();
 
@@ -141,6 +143,9 @@ pub const Regex = struct {
     }
 
     pub fn createStreamingMatcher(self: *const Regex, allocator: Allocator) RegexError!streaming.StreamingMatcher {
+        if (!build_options.streaming_enabled) {
+            return RegexError.UnsupportedFeature;
+        }
         if (self.compiled.nfa) |nfa| {
             return streaming.StreamingMatcher.init(allocator, nfa) catch RegexError.OutOfMemory;
         }
@@ -310,7 +315,9 @@ test "quantifier matching" {
     var regex_star = try Regex.compile(allocator, "a*");
     defer regex_star.deinit();
 
-    try std.testing.expect(try regex_star.isMatch(""));
+
+    const empty_match = try regex_star.isMatch("");
+    try std.testing.expect(empty_match);
     try std.testing.expect(try regex_star.isMatch("a"));
     try std.testing.expect(try regex_star.isMatch("aaa"));
     try std.testing.expect(try regex_star.isMatch("bbb"));
@@ -430,10 +437,19 @@ test "jit compilation framework" {
     var regex = try Regex.compile(allocator, "test");
     defer regex.deinit();
 
-    // JIT framework is implemented but disabled
-    try std.testing.expect(regex.compiled.jit_program == null);
+    // JIT framework is implemented and enabled
+    try std.testing.expect(regex.compiled.jit_program != null);
 
     // Regular matching still works
     try std.testing.expect(try regex.isMatch("test input"));
     try std.testing.expect(!try regex.isMatch("no match"));
 }
+
+// Feature detection API
+pub const features = struct {
+    pub const jit = build_options.jit_enabled;
+    pub const unicode = build_options.unicode_full;
+    pub const streaming = build_options.streaming_enabled;
+    pub const capture_groups = build_options.capture_groups;
+    pub const backtracking = build_options.backtracking_enabled;
+};

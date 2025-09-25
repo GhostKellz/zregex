@@ -16,6 +16,22 @@ pub fn build(b: *std.Build) void {
     // between Debug, ReleaseSafe, ReleaseFast, and ReleaseSmall. Here we do not
     // set a preferred release mode, allowing the user to decide how to optimize.
     const optimize = b.standardOptimizeOption(.{});
+
+    // Optional build flags for zregex features
+    const jit_enabled = b.option(bool, "jit", "Enable JIT compilation (default: true)") orelse true;
+    const unicode_full = b.option(bool, "unicode", "Full Unicode support vs ASCII-only (default: true)") orelse true;
+    const streaming = b.option(bool, "streaming", "Enable streaming matcher (default: true)") orelse true;
+    const capture_groups = b.option(bool, "groups", "Enable capture groups (default: true)") orelse true;
+    const backtracking = b.option(bool, "backtracking", "Enable full backtracking vs simple NFA (default: true)") orelse true;
+
+    // Create build options to pass to the module
+    const options = b.addOptions();
+    options.addOption(bool, "jit_enabled", jit_enabled);
+    options.addOption(bool, "unicode_full", unicode_full);
+    options.addOption(bool, "streaming_enabled", streaming);
+    options.addOption(bool, "capture_groups", capture_groups);
+    options.addOption(bool, "backtracking_enabled", backtracking);
+
     // It's also possible to define more custom flags to toggle optional features
     // of this build script using `b.option()`. All defined flags (including
     // target and optimize options) will be listed when running `zig build --help`
@@ -39,6 +55,9 @@ pub fn build(b: *std.Build) void {
         // Later on we'll use this module as the root module of a test executable
         // which requires us to specify a target.
         .target = target,
+        .imports = &.{
+            .{ .name = "build_options", .module = options.createModule() },
+        },
     });
 
     // Here we define an executable. An executable needs to have a root module

@@ -10,6 +10,7 @@ const RegexError = root.RegexError;
 pub const NFAMatcher = struct {
     nfa: *const NFA,
     allocator: Allocator,
+    capture_groups: bool = true,
 
     pub fn init(allocator: Allocator, nfa: *const NFA) NFAMatcher {
         return NFAMatcher{
@@ -19,11 +20,16 @@ pub const NFAMatcher = struct {
     }
 
     pub fn findMatch(self: *const NFAMatcher, input: []const u8) RegexError!?Match {
+        return self.findMatchWithGroups(input, null);
+    }
+
+    pub fn findMatchWithGroups(self: *const NFAMatcher, input: []const u8, groups: ?*std.ArrayList(?Match)) RegexError!?Match {
         for (0..input.len + 1) |start_pos| {
-            if (try self.matchAt(input, start_pos)) |end_pos| {
+            if (try self.matchAtWithGroups(input, start_pos, groups)) |end_pos| {
                 return Match{
                     .start = start_pos,
                     .end = end_pos,
+                    .groups = if (groups) |g| g.items else null,
                 };
             }
         }
@@ -31,6 +37,10 @@ pub const NFAMatcher = struct {
     }
 
     fn matchAt(self: *const NFAMatcher, input: []const u8, start_pos: usize) RegexError!?usize {
+        return self.matchAtWithGroups(input, start_pos, null);
+    }
+
+    fn matchAtWithGroups(self: *const NFAMatcher, input: []const u8, start_pos: usize, groups: ?*std.ArrayList(?Match)) RegexError!?usize {
         var current_states = std.ArrayList(u32){};
         defer current_states.deinit(self.allocator);
 
@@ -38,6 +48,7 @@ pub const NFAMatcher = struct {
         defer next_states.deinit(self.allocator);
 
         try self.addEpsilonClosure(&current_states, self.nfa.start_state);
+
 
         var pos = start_pos;
         while (pos <= input.len) {
@@ -48,7 +59,10 @@ pub const NFAMatcher = struct {
             if (pos >= input.len) break;
 
             const char = input[pos];
-            try self.stepStates(&current_states, &next_states, char);
+            if (groups) |_| {
+            // TODO: Implement group capture tracking
+        }
+        try self.stepStates(&current_states, &next_states, char);
 
             const tmp = current_states;
             current_states = next_states;
@@ -110,6 +124,23 @@ pub const NFAMatcher = struct {
             .any_char => return char != '\n', // . doesn't match newline by default
             .char_class => |*char_class| {
                 const codepoint: u21 = char; // For now, treat as ASCII
+                for (char_class.ranges.items) |range| {
+                    if (codepoint >= range.start and codepoint <= range.end) {
+                        return !char_class.negated;
+                    }
+                }
+                return char_class.negated;
+            },
+        }
+    }
+
+    fn matchesTransitionUnicode(self: *const NFAMatcher, condition: NFA.TransitionCondition, codepoint: u21) bool {
+        _ = self;
+        switch (condition) {
+            .epsilon => return false,
+            .char => |c| return c == codepoint and codepoint <= 127, // ASCII only for char
+            .any_char => return codepoint != '\n',
+            .char_class => |*char_class| {
                 for (char_class.ranges.items) |range| {
                     if (codepoint >= range.start and codepoint <= range.end) {
                         return !char_class.negated;
