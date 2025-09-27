@@ -19,17 +19,48 @@ pub const NFAMatcher = struct {
         };
     }
 
+    const GroupCapture = struct {
+        group_id: u32,
+        start: ?usize = null,
+        end: ?usize = null,
+    };
+
     pub fn findMatch(self: *const NFAMatcher, input: []const u8) RegexError!?Match {
-        return self.findMatchWithGroups(input, null);
+        return self.findMatchFrom(input, 0);
+    }
+
+    pub fn findMatchFrom(self: *const NFAMatcher, input: []const u8, start_offset: usize) RegexError!?Match {
+        return self.findMatchFromWithGroups(input, start_offset, null);
     }
 
     pub fn findMatchWithGroups(self: *const NFAMatcher, input: []const u8, groups: ?*std.ArrayList(?Match)) RegexError!?Match {
-        for (0..input.len + 1) |start_pos| {
-            if (try self.matchAtWithGroups(input, start_pos, groups)) |end_pos| {
+        return self.findMatchFromWithGroups(input, 0, groups);
+    }
+
+    pub fn isMatchOnly(self: *const NFAMatcher, input: []const u8) RegexError!bool {
+        // Efficient boolean-only matching without group allocation
+        var pos: usize = 0;
+        while (pos <= input.len) : (pos += 1) {
+            if (try self.matchAt(input, pos)) |_| {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    fn findMatchFromWithGroups(self: *const NFAMatcher, input: []const u8, start_offset: usize, groups: ?*std.ArrayList(?Match)) RegexError!?Match {
+        var pos = start_offset;
+        while (pos <= input.len) : (pos += 1) {
+            if (groups) |g| g.clearRetainingCapacity();
+            if (try self.matchAtWithGroups(input, pos, groups)) |end_pos| {
+                var groups_slice: ?[]?Match = null;
+                if (groups) |g| {
+                    groups_slice = try self.allocator.dupe(?Match, g.items);
+                }
                 return Match{
-                    .start = start_pos,
+                    .start = pos,
                     .end = end_pos,
-                    .groups = if (groups) |g| g.items else null,
+                    .groups = groups_slice,
                 };
             }
         }
@@ -47,8 +78,13 @@ pub const NFAMatcher = struct {
         var next_states = std.ArrayList(u32){};
         defer next_states.deinit(self.allocator);
 
-        try self.addEpsilonClosure(&current_states, self.nfa.start_state);
+        // Use group-aware epsilon closure
+        var visited = std.ArrayList(bool){};
+        defer visited.deinit(self.allocator);
+        try visited.resize(self.allocator, self.nfa.states.items.len);
+        for (visited.items) |*v| v.* = false;
 
+        try self.addEpsilonClosureRecWithGroups(&current_states, self.nfa.start_state, &visited, start_pos, input, groups);
 
         var pos = start_pos;
         while (pos <= input.len) {
@@ -58,18 +94,22 @@ pub const NFAMatcher = struct {
 
             if (pos >= input.len) break;
 
-            const char = input[pos];
-            if (groups) |_| {
-            // TODO: Implement group capture tracking
-        }
-        try self.stepStates(&current_states, &next_states, char);
+            // Decode UTF-8 codepoint
+            var decode_pos = pos;
+            const codepoint = unicode.utf8DecodeNext(input, &decode_pos);
+            if (codepoint) |cp| {
+                try self.stepStatesWithGroupsUnicode(&current_states, &next_states, cp, decode_pos, input, groups);
 
-            const tmp = current_states;
-            current_states = next_states;
-            next_states = tmp;
-            next_states.clearRetainingCapacity();
+                const tmp = current_states;
+                current_states = next_states;
+                next_states = tmp;
+                next_states.clearRetainingCapacity();
 
-            pos += 1;
+                pos = decode_pos;
+            } else {
+                // Invalid UTF-8, skip byte
+                pos += 1;
+            }
         }
 
         if (self.hasAcceptState(&current_states)) {
@@ -79,17 +119,17 @@ pub const NFAMatcher = struct {
         return null;
     }
 
-    fn addEpsilonClosure(self: *const NFAMatcher, states: *std.ArrayList(u32), state_id: u32) RegexError!void {
+    fn addEpsilonClosure(self: *const NFAMatcher, states: *std.ArrayList(u32), state_id: u32, current_pos: usize, input: []const u8) RegexError!void {
         var visited = std.ArrayList(bool){};
         defer visited.deinit(self.allocator);
 
         try visited.resize(self.allocator, self.nfa.states.items.len);
         for (visited.items) |*v| v.* = false;
 
-        try self.addEpsilonClosureRec(states, state_id, &visited);
+        try self.addEpsilonClosureRec(states, state_id, &visited, current_pos, input);
     }
 
-    fn addEpsilonClosureRec(self: *const NFAMatcher, states: *std.ArrayList(u32), state_id: u32, visited: *std.ArrayList(bool)) RegexError!void {
+    fn addEpsilonClosureRecWithGroups(self: *const NFAMatcher, states: *std.ArrayList(u32), state_id: u32, visited: *std.ArrayList(bool), current_pos: usize, input: []const u8, groups: ?*std.ArrayList(?Match)) RegexError!void {
         if (state_id >= self.nfa.states.items.len or visited.items[state_id]) {
             return;
         }
@@ -99,18 +139,71 @@ pub const NFAMatcher = struct {
 
         const state = &self.nfa.states.items[state_id];
         for (state.transitions.items) |transition| {
-            if (transition.condition == .epsilon) {
-                try self.addEpsilonClosureRec(states, transition.target, visited);
+            switch (transition.condition) {
+                .epsilon => try self.addEpsilonClosureRecWithGroups(states, transition.target, visited, current_pos, input, groups),
+                .assert_start => {
+                    if (current_pos == 0) {
+                        try self.addEpsilonClosureRecWithGroups(states, transition.target, visited, current_pos, input, groups);
+                    }
+                },
+                .assert_end => {
+                    if (current_pos == input.len) {
+                        try self.addEpsilonClosureRecWithGroups(states, transition.target, visited, current_pos, input, groups);
+                    }
+                },
+                .group_start => |group_id| {
+                    if (groups) |g| {
+                        // Ensure groups array is large enough
+                        while (g.items.len <= group_id) {
+                            try g.append(self.allocator, null);
+                        }
+                        // Initialize or update group start
+                        g.items[group_id] = Match{ .start = current_pos, .end = current_pos, .groups = null };
+                    }
+                    try self.addEpsilonClosureRecWithGroups(states, transition.target, visited, current_pos, input, groups);
+                },
+                .group_end => |group_id| {
+                    if (groups) |g| {
+                        // Ensure groups array is large enough
+                        while (g.items.len <= group_id) {
+                            try g.append(self.allocator, null);
+                        }
+                        // Update group end position
+                        if (g.items[group_id]) |*existing| {
+                            existing.end = current_pos;
+                        }
+                    }
+                    try self.addEpsilonClosureRecWithGroups(states, transition.target, visited, current_pos, input, groups);
+                },
+                else => {},
             }
         }
     }
 
-    fn stepStates(self: *const NFAMatcher, current: *std.ArrayList(u32), next: *std.ArrayList(u32), char: u8) RegexError!void {
+    fn addEpsilonClosureRec(self: *const NFAMatcher, states: *std.ArrayList(u32), state_id: u32, visited: *std.ArrayList(bool), current_pos: usize, input: []const u8) RegexError!void {
+        return self.addEpsilonClosureRecWithGroups(states, state_id, visited, current_pos, input, null);
+    }
+
+    fn stepStates(self: *const NFAMatcher, current: *std.ArrayList(u32), next: *std.ArrayList(u32), char: u8, next_pos: usize, input: []const u8) RegexError!void {
+        return self.stepStatesWithGroups(current, next, char, next_pos, input, null);
+    }
+
+    fn stepStatesWithGroups(self: *const NFAMatcher, current: *std.ArrayList(u32), next: *std.ArrayList(u32), char: u8, next_pos: usize, input: []const u8, groups: ?*std.ArrayList(?Match)) RegexError!void {
+        const codepoint: u21 = char;
+        return self.stepStatesWithGroupsUnicode(current, next, codepoint, next_pos, input, groups);
+    }
+
+    fn stepStatesWithGroupsUnicode(self: *const NFAMatcher, current: *std.ArrayList(u32), next: *std.ArrayList(u32), codepoint: u21, next_pos: usize, input: []const u8, groups: ?*std.ArrayList(?Match)) RegexError!void {
         for (current.items) |state_id| {
             const state = &self.nfa.states.items[state_id];
             for (state.transitions.items) |transition| {
-                if (self.matchesTransition(transition.condition, char)) {
-                    try self.addEpsilonClosure(next, transition.target);
+                if (self.matchesTransitionUnicode(transition.condition, codepoint)) {
+                    var visited = std.ArrayList(bool){};
+                    defer visited.deinit(self.allocator);
+                    try visited.resize(self.allocator, self.nfa.states.items.len);
+                    for (visited.items) |*v| v.* = false;
+
+                    try self.addEpsilonClosureRecWithGroups(next, transition.target, &visited, next_pos, input, groups);
                 }
             }
         }
@@ -123,14 +216,11 @@ pub const NFAMatcher = struct {
             .char => |c| return c == char,
             .any_char => return char != '\n', // . doesn't match newline by default
             .char_class => |*char_class| {
-                const codepoint: u21 = char; // For now, treat as ASCII
-                for (char_class.ranges.items) |range| {
-                    if (codepoint >= range.start and codepoint <= range.end) {
-                        return !char_class.negated;
-                    }
-                }
-                return char_class.negated;
+                const codepoint: u21 = char;
+                return char_class.matches(codepoint);
             },
+            .assert_start, .assert_end => return false,
+            .group_start, .group_end => return false, // Group transitions don't consume characters
         }
     }
 
@@ -141,13 +231,10 @@ pub const NFAMatcher = struct {
             .char => |c| return c == codepoint and codepoint <= 127, // ASCII only for char
             .any_char => return codepoint != '\n',
             .char_class => |*char_class| {
-                for (char_class.ranges.items) |range| {
-                    if (codepoint >= range.start and codepoint <= range.end) {
-                        return !char_class.negated;
-                    }
-                }
-                return char_class.negated;
+                return char_class.matches(codepoint);
             },
+            .assert_start, .assert_end => return false,
+            .group_start, .group_end => return false, // Group transitions don't consume characters
         }
     }
 

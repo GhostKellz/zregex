@@ -107,6 +107,13 @@ pub const JITCompiler = struct {
                     // Follow epsilon transitions immediately
                     try self.compileStateRecursive(nfa, transition.target, visited);
                 },
+                .assert_start, .assert_end => {
+                    try self.compileStateRecursive(nfa, transition.target, visited);
+                },
+                .group_start, .group_end => {
+                    // Treat group transitions as epsilon for JIT (no group tracking in JIT yet)
+                    try self.compileStateRecursive(nfa, transition.target, visited);
+                },
                 .char => |c| {
                     try self.instructions.append(self.allocator, .{ .char = c });
                     try self.compileStateRecursive(nfa, transition.target, visited);

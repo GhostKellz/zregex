@@ -87,8 +87,17 @@ pub const NFABuilder = struct {
             .group => |group| {
                 return try self.compileNode(group);
             },
-            .anchor_start, .anchor_end => {
-                return try self.compileEpsilon();
+            .capture_group => |cap_group| {
+                return try self.compileCaptureGroup(cap_group.node, cap_group.group_id);
+            },
+            .non_capture_group => |non_cap_group| {
+                return try self.compileNode(non_cap_group);
+            },
+            .anchor_start => {
+                return try self.compileAnchorStart();
+            },
+            .anchor_end => {
+                return try self.compileAnchorEnd();
             },
         }
     }
@@ -131,6 +140,9 @@ pub const NFABuilder = struct {
             });
         }
         root_char_class.negated = char_class.negated;
+
+        // Optimize for ASCII fast path
+        root_char_class.optimizeForAscii();
 
         try self.addTransition(start_state, end_state, .{ .char_class = root_char_class });
 
@@ -240,6 +252,30 @@ pub const NFABuilder = struct {
         };
     }
 
+    fn compileAnchorStart(self: *NFABuilder) std.mem.Allocator.Error!Fragment {
+        const start_state = try self.createState();
+        const end_state = try self.createState();
+
+        try self.addTransition(start_state, end_state, .assert_start);
+
+        return Fragment{
+            .start = start_state,
+            .end = end_state,
+        };
+    }
+
+    fn compileAnchorEnd(self: *NFABuilder) std.mem.Allocator.Error!Fragment {
+        const start_state = try self.createState();
+        const end_state = try self.createState();
+
+        try self.addTransition(start_state, end_state, .assert_end);
+
+        return Fragment{
+            .start = start_state,
+            .end = end_state,
+        };
+    }
+
     fn compileRange(self: *NFABuilder, node: *parser.Node, min: u32, max: ?u32) std.mem.Allocator.Error!Fragment {
         if (min == 0) {
             const optional_frag = try self.compileOptional(node);
@@ -265,6 +301,23 @@ pub const NFABuilder = struct {
         }
 
         return current_frag;
+    }
+
+    fn compileCaptureGroup(self: *NFABuilder, node: *parser.Node, group_id: u32) std.mem.Allocator.Error!Fragment {
+        const start_state = try self.createState();
+        const inner_frag = try self.compileNode(node);
+        const end_state = try self.createState();
+
+        // Add group start transition
+        try self.addTransition(start_state, inner_frag.start, .{ .group_start = group_id });
+
+        // Add group end transition
+        try self.addTransition(inner_frag.end, end_state, .{ .group_end = group_id });
+
+        return Fragment{
+            .start = start_state,
+            .end = end_state,
+        };
     }
 };
 

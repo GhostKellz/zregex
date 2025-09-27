@@ -11,6 +11,22 @@ pub const ParseError = error{
     OutOfMemory,
 };
 
+pub const ParseDiagnostic = struct {
+    error_type: ParseError,
+    position: usize,
+    line: usize,
+    column: usize,
+    message: []const u8,
+    context: []const u8, // Surrounding text for context
+
+    pub fn format(self: ParseDiagnostic, allocator: Allocator) ![]const u8 {
+        return std.fmt.allocPrint(allocator,
+            "Parse error at line {}, column {}: {s}\n  Context: ...{s}...\n  Position: {s}^",
+            .{ self.line + 1, self.column + 1, self.message, self.context, " " ** self.column }
+        );
+    }
+};
+
 pub const AST = struct {
     root: *Node,
     allocator: Allocator,
@@ -28,6 +44,11 @@ pub const Node = union(enum) {
     anchor_start,
     anchor_end,
     group: *Node,
+    capture_group: struct {
+        node: *Node,
+        group_id: u32,
+    },
+    non_capture_group: *Node,
     alternation: struct {
         left: *Node,
         right: *Node,
@@ -50,6 +71,14 @@ pub const Node = union(enum) {
             .group => |group| {
                 group.deinit(allocator);
                 allocator.destroy(group);
+            },
+            .capture_group => |cap_group| {
+                cap_group.node.deinit(allocator);
+                allocator.destroy(cap_group.node);
+            },
+            .non_capture_group => |non_cap_group| {
+                non_cap_group.deinit(allocator);
+                allocator.destroy(non_cap_group);
             },
             .alternation => |alt| {
                 alt.left.deinit(allocator);
@@ -76,8 +105,8 @@ pub const CharClass = struct {
     negated: bool,
 
     pub const CharRange = struct {
-        start: u8,
-        end: u8,
+        start: u21,
+        end: u21,
     };
 
     pub fn init(allocator: Allocator) CharClass {
@@ -97,13 +126,60 @@ pub const Parser = struct {
     input: []const u8,
     pos: usize,
     allocator: Allocator,
+    next_group_id: u32,
+    line: usize,
+    column: usize,
+    diagnostics: std.ArrayList(ParseDiagnostic),
 
     pub fn init(allocator: Allocator, pattern: []const u8) Parser {
         return Parser{
             .input = pattern,
             .pos = 0,
             .allocator = allocator,
+            .next_group_id = 1, // Group 0 is reserved for the full match
+            .line = 0,
+            .column = 0,
+            .diagnostics = std.ArrayList(ParseDiagnostic){},
         };
+    }
+
+    pub fn deinit(self: *Parser) void {
+        for (self.diagnostics.items) |*diag| {
+            self.allocator.free(diag.message);
+            self.allocator.free(diag.context);
+        }
+        self.diagnostics.deinit(self.allocator);
+    }
+
+    fn advance(self: *Parser) void {
+        if (self.pos < self.input.len) {
+            if (self.input[self.pos] == '\n') {
+                self.line += 1;
+                self.column = 0;
+            } else {
+                self.column += 1;
+            }
+            self.pos += 1;
+        }
+    }
+
+    fn addDiagnostic(self: *Parser, error_type: ParseError, message: []const u8) !void {
+        const context_start = if (self.pos >= 10) self.pos - 10 else 0;
+        const context_end = if (self.pos + 10 < self.input.len) self.pos + 10 else self.input.len;
+        const context = try self.allocator.dupe(u8, self.input[context_start..context_end]);
+
+        const owned_message = try self.allocator.dupe(u8, message);
+
+        const diagnostic = ParseDiagnostic{
+            .error_type = error_type,
+            .position = self.pos,
+            .line = self.line,
+            .column = self.column,
+            .message = owned_message,
+            .context = context,
+        };
+
+        try self.diagnostics.append(self.allocator, diagnostic);
     }
 
     pub fn parse(self: *Parser) ParseError!AST {
@@ -118,7 +194,7 @@ pub const Parser = struct {
         var left = try self.parseConcatenation();
 
         while (self.pos < self.input.len and self.input[self.pos] == '|') {
-            self.pos += 1;
+            self.advance();
             const right = try self.parseConcatenation();
             const alt_node = try self.allocator.create(Node);
             alt_node.* = Node{
@@ -169,6 +245,7 @@ pub const Parser = struct {
 
     fn parseAtom(self: *Parser) ParseError!*Node {
         if (self.pos >= self.input.len) {
+            try self.addDiagnostic(ParseError.UnexpectedCharacter, "Unexpected end of pattern");
             return ParseError.UnexpectedCharacter;
         }
 
@@ -177,29 +254,50 @@ pub const Parser = struct {
 
         switch (c) {
             '.' => {
-                self.pos += 1;
+                self.advance();
                 node = try self.allocator.create(Node);
                 node.* = Node{ .any_char = {} };
             },
             '^' => {
-                self.pos += 1;
+                self.advance();
                 node = try self.allocator.create(Node);
                 node.* = Node{ .anchor_start = {} };
             },
             '$' => {
-                self.pos += 1;
+                self.advance();
                 node = try self.allocator.create(Node);
                 node.* = Node{ .anchor_end = {} };
             },
             '(' => {
-                self.pos += 1;
-                const group = try self.parseAlternation();
-                if (self.pos >= self.input.len or self.input[self.pos] != ')') {
-                    return ParseError.UnbalancedParentheses;
+                self.advance();
+                // Check for non-capturing group (?:...)
+                if (self.pos + 1 < self.input.len and
+                    self.input[self.pos] == '?' and
+                    self.input[self.pos + 1] == ':') {
+                    // Non-capturing group
+                    self.advance(); // '?'
+                    self.advance(); // ':'
+                    const group = try self.parseAlternation();
+                    if (self.pos >= self.input.len or self.input[self.pos] != ')') {
+                        try self.addDiagnostic(ParseError.UnbalancedParentheses, "Missing closing ')' for non-capturing group");
+                        return ParseError.UnbalancedParentheses;
+                    }
+                    self.advance();
+                    node = try self.allocator.create(Node);
+                    node.* = Node{ .non_capture_group = group };
+                } else {
+                    // Capturing group
+                    const group_id = self.next_group_id;
+                    self.next_group_id += 1;
+                    const group = try self.parseAlternation();
+                    if (self.pos >= self.input.len or self.input[self.pos] != ')') {
+                        try self.addDiagnostic(ParseError.UnbalancedParentheses, "Missing closing ')' for capture group");
+                        return ParseError.UnbalancedParentheses;
+                    }
+                    self.advance();
+                    node = try self.allocator.create(Node);
+                    node.* = Node{ .capture_group = .{ .node = group, .group_id = group_id } };
                 }
-                self.pos += 1;
-                node = try self.allocator.create(Node);
-                node.* = Node{ .group = group };
             },
             '[' => {
                 node = try self.parseCharacterClass();
@@ -208,10 +306,11 @@ pub const Parser = struct {
                 node = try self.parseEscape();
             },
             '*', '+', '?', '{' => {
+                try self.addDiagnostic(ParseError.UnexpectedCharacter, "Quantifier without preceding element");
                 return ParseError.UnexpectedCharacter;
             },
             else => {
-                self.pos += 1;
+                self.advance();
                 node = try self.allocator.create(Node);
                 node.* = Node{ .literal = c };
             },
@@ -222,25 +321,26 @@ pub const Parser = struct {
 
     fn parseCharacterClass(self: *Parser) ParseError!*Node {
         if (self.pos >= self.input.len or self.input[self.pos] != '[') {
+            try self.addDiagnostic(ParseError.InvalidCharacterClass, "Expected '[' to start character class");
             return ParseError.InvalidCharacterClass;
         }
 
-        self.pos += 1;
+        self.advance(); // '['
         var char_class = CharClass.init(self.allocator);
 
         if (self.pos < self.input.len and self.input[self.pos] == '^') {
             char_class.negated = true;
-            self.pos += 1;
+            self.advance();
         }
 
         while (self.pos < self.input.len and self.input[self.pos] != ']') {
             const start = self.input[self.pos];
-            self.pos += 1;
+            self.advance();
 
             if (self.pos < self.input.len - 1 and self.input[self.pos] == '-' and self.input[self.pos + 1] != ']') {
-                self.pos += 1;
+                self.advance(); // '-'
                 const end = self.input[self.pos];
-                self.pos += 1;
+                self.advance();
                 try char_class.ranges.append(self.allocator, .{ .start = start, .end = end });
             } else {
                 try char_class.ranges.append(self.allocator, .{ .start = start, .end = start });
@@ -248,9 +348,11 @@ pub const Parser = struct {
         }
 
         if (self.pos >= self.input.len or self.input[self.pos] != ']') {
+            char_class.deinit(self.allocator); // Clean up allocated ranges
+            try self.addDiagnostic(ParseError.InvalidCharacterClass, "Missing closing ']' for character class");
             return ParseError.InvalidCharacterClass;
         }
-        self.pos += 1;
+        self.advance(); // ']'
 
         const node = try self.allocator.create(Node);
         node.* = Node{ .char_class = char_class };
@@ -259,16 +361,18 @@ pub const Parser = struct {
 
     fn parseEscape(self: *Parser) ParseError!*Node {
         if (self.pos >= self.input.len or self.input[self.pos] != '\\') {
+            try self.addDiagnostic(ParseError.InvalidEscape, "Expected '\\' to start escape sequence");
             return ParseError.InvalidEscape;
         }
 
-        self.pos += 1;
+        self.advance(); // '\'
         if (self.pos >= self.input.len) {
+            try self.addDiagnostic(ParseError.InvalidEscape, "Incomplete escape sequence at end of pattern");
             return ParseError.InvalidEscape;
         }
 
         const escaped_char = self.input[self.pos];
-        self.pos += 1;
+        self.advance();
 
         const node = try self.allocator.create(Node);
         switch (escaped_char) {
@@ -294,6 +398,48 @@ pub const Parser = struct {
 
                 node.* = Node{ .char_class = char_class };
             },
+            'p', 'P' => {
+                // Unicode properties: \p{Letter}, \P{Number}, etc.
+                if (self.pos >= self.input.len or self.input[self.pos] != '{') {
+                    return ParseError.InvalidEscape;
+                }
+                self.advance(); // Skip '{'
+
+                const start_pos = self.pos;
+                while (self.pos < self.input.len and self.input[self.pos] != '}') {
+                    self.advance();
+                }
+
+                if (self.pos >= self.input.len) {
+                    return ParseError.InvalidEscape;
+                }
+
+                const property_spec = self.input[start_pos..self.pos];
+                self.advance(); // Skip '}'
+
+                // Import unicode_properties module
+                const unicode_props = @import("unicode_properties.zig");
+
+                var char_class = CharClass.init(self.allocator);
+                var unicode_prop = unicode_props.parsePropertySpec(self.allocator, property_spec) catch {
+                    return ParseError.InvalidEscape;
+                };
+                defer unicode_prop.deinit(self.allocator);
+
+                for (unicode_prop.ranges.items) |range| {
+                    try char_class.ranges.append(self.allocator, .{
+                        .start = range.start,
+                        .end = range.end,
+                    });
+                }
+
+                // \P means negated
+                if (escaped_char == 'P') {
+                    char_class.negated = true;
+                }
+
+                node.* = Node{ .char_class = char_class };
+            },
             '\\', '.', '^', '$', '*', '+', '?', '(', ')', '[', ']', '{', '}', '|' => {
                 node.* = Node{ .literal = escaped_char };
             },
@@ -315,22 +461,22 @@ pub const Parser = struct {
 
         switch (c) {
             '*' => {
-                self.pos += 1;
+                self.advance();
                 min = 0;
                 max = null;
             },
             '+' => {
-                self.pos += 1;
+                self.advance();
                 min = 1;
                 max = null;
             },
             '?' => {
-                self.pos += 1;
+                self.advance();
                 min = 0;
                 max = 1;
             },
             '{' => {
-                self.pos += 1;
+                self.advance();
                 const result = try self.parseQuantifierRange();
                 min = result.min;
                 max = result.max;
@@ -340,7 +486,7 @@ pub const Parser = struct {
 
         if (self.pos < self.input.len and self.input[self.pos] == '?') {
             greedy = false;
-            self.pos += 1;
+            self.advance();
         }
 
         const quant_node = try self.allocator.create(Node);
@@ -362,16 +508,16 @@ pub const Parser = struct {
 
         while (self.pos < self.input.len and std.ascii.isDigit(self.input[self.pos])) {
             min = min * 10 + (self.input[self.pos] - '0');
-            self.pos += 1;
+            self.advance();
         }
 
         if (self.pos < self.input.len and self.input[self.pos] == ',') {
-            self.pos += 1;
+            self.advance();
             if (self.pos < self.input.len and std.ascii.isDigit(self.input[self.pos])) {
                 var max_val: u32 = 0;
                 while (self.pos < self.input.len and std.ascii.isDigit(self.input[self.pos])) {
                     max_val = max_val * 10 + (self.input[self.pos] - '0');
-                    self.pos += 1;
+                    self.advance();
                 }
                 max = max_val;
             }
@@ -380,9 +526,10 @@ pub const Parser = struct {
         }
 
         if (self.pos >= self.input.len or self.input[self.pos] != '}') {
+            try self.addDiagnostic(ParseError.InvalidQuantifier, "Missing closing '}' for quantifier range");
             return ParseError.InvalidQuantifier;
         }
-        self.pos += 1;
+        self.advance();
 
         return .{ .min = min, .max = max };
     }
@@ -406,10 +553,46 @@ test "quantifier parsing" {
     const allocator = gpa.allocator();
 
     var parser = Parser.init(allocator, "a*");
+    defer parser.deinit();
     var ast = try parser.parse();
     defer ast.deinit();
 
     try std.testing.expect(ast.root.* == .quantifier);
     try std.testing.expect(ast.root.quantifier.min == 0);
     try std.testing.expect(ast.root.quantifier.max == null);
+}
+
+test "parser diagnostics" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Test unbalanced parentheses - simpler case to avoid memory leaks
+    var parser = Parser.init(allocator, "[unclosed");
+    defer parser.deinit();
+
+    const result = parser.parse();
+    try std.testing.expectError(ParseError.InvalidCharacterClass, result);
+    try std.testing.expect(parser.diagnostics.items.len > 0);
+
+    const diagnostic = parser.diagnostics.items[0];
+    try std.testing.expect(diagnostic.error_type == ParseError.InvalidCharacterClass);
+}
+
+test "parser diagnostics with quantifier error" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Test quantifier without preceding element
+    var parser = Parser.init(allocator, "*");
+    defer parser.deinit();
+
+    const result = parser.parse();
+    try std.testing.expectError(ParseError.UnexpectedCharacter, result);
+    try std.testing.expect(parser.diagnostics.items.len > 0);
+
+    const diagnostic = parser.diagnostics.items[0];
+    try std.testing.expect(diagnostic.error_type == ParseError.UnexpectedCharacter);
+    try std.testing.expect(diagnostic.position == 0);
 }
