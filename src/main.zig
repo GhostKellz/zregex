@@ -157,7 +157,7 @@ fn runMatch(allocator: std.mem.Allocator, pattern: []const u8, input_text: []con
     var match_end: i128 = 0;
 
     if (options.timing) {
-        compile_start = std.time.nanoTimestamp();
+        compile_start = (try std.time.Instant.now()).timestamp.nsec;
     }
 
     if (options.verbose and !options.quiet) {
@@ -189,8 +189,8 @@ fn runMatch(allocator: std.mem.Allocator, pattern: []const u8, input_text: []con
     defer regex.deinit();
 
     if (options.timing) {
-        compile_end = std.time.nanoTimestamp();
-        match_start = std.time.nanoTimestamp();
+        compile_end = (try std.time.Instant.now()).timestamp.nsec;
+        match_start = (try std.time.Instant.now()).timestamp.nsec;
     }
 
     if (options.verbose and !options.quiet) {
@@ -200,7 +200,7 @@ fn runMatch(allocator: std.mem.Allocator, pattern: []const u8, input_text: []con
     const found_match = try regex.find(input_text);
 
     if (options.timing) {
-        match_end = std.time.nanoTimestamp();
+        match_end = (try std.time.Instant.now()).timestamp.nsec;
     }
 
     if (found_match) |match| {
