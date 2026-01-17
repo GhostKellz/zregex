@@ -33,7 +33,21 @@ pub const Fuzzer = struct {
     };
 
     pub fn init(allocator: Allocator, config: FuzzingConfig) Fuzzer {
-        const seed = config.seed orelse @intCast(std.time.milliTimestamp());
+        // Use Instant.now() for seed generation (Zig 0.16.0-dev compatible)
+        const seed = config.seed orelse blk: {
+            const instant = std.time.Instant.now() catch {
+                // Fallback to a fixed seed if clock is unavailable
+                break :blk @as(u64, 0x12345678);
+            };
+            // Extract seed from the instant timestamp
+            const timestamp = instant.timestamp;
+            if (@TypeOf(timestamp) == u64) {
+                break :blk timestamp;
+            } else {
+                // For timespec, combine sec and nsec
+                break :blk @as(u64, @intCast(timestamp.sec)) ^ @as(u64, @intCast(timestamp.nsec));
+            }
+        };
         return Fuzzer{
             .allocator = allocator,
             .rng = std.rand.DefaultPrng.init(seed),
@@ -149,7 +163,14 @@ pub const Fuzzer = struct {
     pub fn testPattern(self: *Fuzzer, pattern: []const u8, input: []const u8) !FuzzResult {
         self.stats.patterns_tested += 1;
 
-        const start_time = std.time.milliTimestamp();
+        // Use Timer for execution timing (Zig 0.16.0-dev compatible)
+        var timer = std.time.Timer.start() catch {
+            return FuzzResult{
+                .status = .runtime_error,
+                .error_msg = "TimerUnsupported",
+                .execution_time = 0,
+            };
+        };
 
         // Use a separate allocator for memory leak detection
         var arena = std.heap.ArenaAllocator.init(self.allocator);
@@ -159,24 +180,27 @@ pub const Fuzzer = struct {
         // Try to compile the pattern
         var regex = Regex.compile(test_allocator, pattern) catch |err| {
             self.stats.patterns_failed += 1;
+            const elapsed_ns = timer.read();
             return FuzzResult{
                 .status = .compile_error,
                 .error_msg = @errorName(err),
-                .execution_time = @intCast(std.time.milliTimestamp() - start_time),
+                .execution_time = elapsed_ns / std.time.ns_per_ms,
             };
         };
         defer regex.deinit();
 
         // Test matching with timeout
         const match_result = regex.find(input) catch |err| {
+            const elapsed_ns = timer.read();
             return FuzzResult{
                 .status = .runtime_error,
                 .error_msg = @errorName(err),
-                .execution_time = @intCast(std.time.milliTimestamp() - start_time),
+                .execution_time = elapsed_ns / std.time.ns_per_ms,
             };
         };
 
-        const execution_time = @intCast(std.time.milliTimestamp() - start_time);
+        const elapsed_ns = timer.read();
+        const execution_time = elapsed_ns / std.time.ns_per_ms;
 
         // Check for potential ReDoS
         if (self.config.enable_redos_detection and execution_time > self.config.timeout_ms) {
@@ -254,11 +278,23 @@ pub const CorpusFuzzer = struct {
     };
 
     pub fn init(allocator: Allocator, seed: ?u64) CorpusFuzzer {
+        // Use Instant.now() for seed generation (Zig 0.16.0-dev compatible)
+        const actual_seed = seed orelse blk: {
+            const instant = std.time.Instant.now() catch {
+                break :blk @as(u64, 0x87654321);
+            };
+            const timestamp = instant.timestamp;
+            if (@TypeOf(timestamp) == u64) {
+                break :blk timestamp;
+            } else {
+                break :blk @as(u64, @intCast(timestamp.sec)) ^ @as(u64, @intCast(timestamp.nsec));
+            }
+        };
         return CorpusFuzzer{
             .allocator = allocator,
             .corpus = std.ArrayList([]const u8){},
             .mutations = std.ArrayList(MutationStrategy){},
-            .rng = std.rand.DefaultPrng.init(seed orelse @intCast(std.time.milliTimestamp())),
+            .rng = std.rand.DefaultPrng.init(actual_seed),
         };
     }
 

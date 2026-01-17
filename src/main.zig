@@ -2,12 +2,6 @@ const std = @import("std");
 const print = std.debug.print;
 const zregex = @import("zregex");
 
-const ArgError = error{
-    InvalidArguments,
-    MissingPattern,
-    MissingInput,
-};
-
 const CliOptions = struct {
     verbose: bool = false,
     quiet: bool = false,
@@ -15,13 +9,11 @@ const CliOptions = struct {
     groups_only: bool = false,
 };
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    const arena = init.arena.allocator();
 
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+    const args = try init.minimal.args.toSlice(arena);
 
     if (args.len < 2) {
         try printUsage();
@@ -150,14 +142,13 @@ fn printFeatures() !void {
 }
 
 fn runMatch(allocator: std.mem.Allocator, pattern: []const u8, input_text: []const u8, options: CliOptions) !void {
-    // Timing setup
-    var compile_start: i128 = 0;
-    var compile_end: i128 = 0;
-    var match_start: i128 = 0;
-    var match_end: i128 = 0;
+    // Timing setup using std.time.Timer (Zig 0.16.0-dev compatible)
+    var timer: ?std.time.Timer = null;
+    var compile_time_ns: u64 = 0;
+    var match_time_ns: u64 = 0;
 
     if (options.timing) {
-        compile_start = (try std.time.Instant.now()).timestamp.nsec;
+        timer = std.time.Timer.start() catch null;
     }
 
     if (options.verbose and !options.quiet) {
@@ -188,9 +179,8 @@ fn runMatch(allocator: std.mem.Allocator, pattern: []const u8, input_text: []con
     };
     defer regex.deinit();
 
-    if (options.timing) {
-        compile_end = (try std.time.Instant.now()).timestamp.nsec;
-        match_start = (try std.time.Instant.now()).timestamp.nsec;
+    if (timer) |*t| {
+        compile_time_ns = t.lap();
     }
 
     if (options.verbose and !options.quiet) {
@@ -199,8 +189,8 @@ fn runMatch(allocator: std.mem.Allocator, pattern: []const u8, input_text: []con
 
     const found_match = try regex.find(input_text);
 
-    if (options.timing) {
-        match_end = (try std.time.Instant.now()).timestamp.nsec;
+    if (timer) |*t| {
+        match_time_ns = t.lap();
     }
 
     if (found_match) |match| {
@@ -261,8 +251,8 @@ fn runMatch(allocator: std.mem.Allocator, pattern: []const u8, input_text: []con
         }
 
         if (options.timing and !options.quiet) {
-            const compile_time = @as(f64, @floatFromInt(compile_end - compile_start)) / 1_000_000.0;
-            const match_time = @as(f64, @floatFromInt(match_end - match_start)) / 1_000_000.0;
+            const compile_time = @as(f64, @floatFromInt(compile_time_ns)) / 1_000_000.0;
+            const match_time = @as(f64, @floatFromInt(match_time_ns)) / 1_000_000.0;
             std.debug.print("  Timing: compile={d:.2}ms, match={d:.2}ms\n", .{ compile_time, match_time });
         }
 
@@ -277,8 +267,8 @@ fn runMatch(allocator: std.mem.Allocator, pattern: []const u8, input_text: []con
         }
 
         if (options.timing and !options.quiet) {
-            const compile_time = @as(f64, @floatFromInt(compile_end - compile_start)) / 1_000_000.0;
-            const match_time = @as(f64, @floatFromInt(match_end - match_start)) / 1_000_000.0;
+            const compile_time = @as(f64, @floatFromInt(compile_time_ns)) / 1_000_000.0;
+            const match_time = @as(f64, @floatFromInt(match_time_ns)) / 1_000_000.0;
             std.debug.print("  Timing: compile={d:.2}ms, match={d:.2}ms\n", .{ compile_time, match_time });
         }
 

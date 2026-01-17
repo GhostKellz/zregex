@@ -2,10 +2,8 @@ const std = @import("std");
 const zregex = @import("src/root.zig");
 const benchmarks = @import("src/benchmarks.zig");
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
 
     std.debug.print("=== zregex Performance Benchmark Suite ===\n\n", .{});
 
@@ -45,16 +43,20 @@ pub fn main() !void {
     var total_compile_time: u64 = 0;
     var compiled_count: u32 = 0;
 
+    // Use Timer for precise timing (Zig 0.16.0-dev compatible)
+    var timer = std.time.Timer.start() catch {
+        std.debug.print("❌ Failed to start timer\n", .{});
+        return;
+    };
+
     for (compile_patterns) |pattern| {
-        const start = std.time.nanoTimestamp();
+        timer.reset();
         var regex = zregex.Regex.compile(allocator, pattern) catch |err| {
             std.debug.print("❌ Failed to compile: {s} - {}\n", .{pattern, err});
             continue;
         };
-        const end = std.time.nanoTimestamp();
+        const compile_time = timer.read();
         regex.deinit();
-
-        const compile_time = @as(u64, @intCast(end - start));
         total_compile_time += compile_time;
         compiled_count += 1;
 

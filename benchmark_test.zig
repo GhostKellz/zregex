@@ -1,10 +1,8 @@
 const std = @import("std");
 const zregex = @import("src/root.zig");
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
 
     std.debug.print("=== zregex Performance Benchmark ===\n\n", .{});
 
@@ -26,16 +24,21 @@ pub fn main() !void {
     var total_compile_time: u64 = 0;
     var test_count: u32 = 0;
 
+    // Use Timer for precise timing (Zig 0.16.0-dev compatible)
+    var timer = std.time.Timer.start() catch {
+        std.debug.print("❌ Failed to start timer\n", .{});
+        return;
+    };
+
     for (test_cases) |test_case| {
-        const start = std.time.nanoTimestamp();
+        timer.reset();
         var regex = zregex.Regex.compile(allocator, test_case.pattern) catch |err| {
             std.debug.print("❌ {s}: Failed to compile - {}\n", .{test_case.name, err});
             continue;
         };
-        const end = std.time.nanoTimestamp();
+        const compile_time = timer.read();
         defer regex.deinit();
 
-        const compile_time = @as(u64, @intCast(end - start));
         total_compile_time += compile_time;
         test_count += 1;
 
@@ -44,7 +47,7 @@ pub fn main() !void {
 
         // Run matching performance test
         const iterations = 10000;
-        const match_start = std.time.nanoTimestamp();
+        timer.reset();
 
         var matches: u32 = 0;
         for (0..iterations) |_| {
@@ -53,8 +56,7 @@ pub fn main() !void {
             }
         }
 
-        const match_end = std.time.nanoTimestamp();
-        const match_time = @as(u64, @intCast(match_end - match_start));
+        const match_time = timer.read();
         const avg_match_time = @as(f64, @floatFromInt(match_time)) / @as(f64, @floatFromInt(iterations)) / 1000.0; // microseconds
 
         std.debug.print("   Matching: {d:.2}μs/op ({} matches)\n", .{avg_match_time, matches});
