@@ -34,7 +34,7 @@
     .dependencies = .{
         .flash = .{
             .url = "https://github.com/ghostkellz/flash/archive/main.tar.gz",
-            .hash = "flash-0.3.2-dnj73xqXBQD9VUfAjBgRYQESldNLyod0kn7Ftz753G6h",
+            .hash = "flash-0.3.2-dnj73xqXBQA56YOmEwVh2aGCVMdzEDcNFmVjWVrKjIbi",
         },
         .flare = .{
             .url = "https://github.com/ghostkellz/flare/archive/main.tar.gz",
